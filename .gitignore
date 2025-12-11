@@ -1,0 +1,7 @@
+# Ignorer tout par défaut
+*
+
+# Mais garder ces fichiers :
+!invoce_manager.py
+!bmanager_facturation.db
+!.gitignore
