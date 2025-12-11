@@ -1917,6 +1917,7 @@ def main():
         page_rapports()
     elif "Configuration" in menu:
         page_configuration()
+# TODO: améliorer le design plus tard
 
 
 if __name__ == "__main__":
