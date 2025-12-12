@@ -288,7 +288,7 @@ def auth_screen() -> bool:
                 }
                 st.success("Connexion réussie.")
                 # On relance l'app → au prochain run, on ne verra plus l'écran de login
-                st.experimental_rerun()
+                st.rerun()
 
     # ----- Onglet création de compte -----
     with tab_register:
@@ -318,7 +318,7 @@ def auth_screen() -> bool:
                         "is_superadmin": False,
                     }
                     st.success("Compte créé, vous êtes maintenant connecté.")
-                    st.experimental_rerun()
+                    st.rerun()
                 except ValueError as e:
                     st.error(str(e))
 
@@ -2225,7 +2225,8 @@ def main():
     st.sidebar.write(f"Connecté en tant que **{user['full_name']}**")
     if st.sidebar.button("Se déconnecter"):
         st.session_state.clear()
-        st.experimental_rerun()
+        st.rerun()
+
 
     # Routing
     if "Clients" in menu:
