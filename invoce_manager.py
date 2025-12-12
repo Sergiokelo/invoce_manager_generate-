@@ -251,19 +251,20 @@ def register_root_user(full_name: str, email: str, password: str):
 
 def auth_screen() -> bool:
     """
-    Écran de connexion / création de compte
+    Affiche l'écran d'auth, retourne False pour stopper l'app
+    (on utilise st.experimental_rerun pour faire disparaître l'écran après login).
     """
     st.title("💼 b-manager – Connexion")
 
     tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
     logged_in = False
 
-    # --- Onglet connexion ---
+    # ----- Onglet connexion -----
     with tab_login:
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Mot de passe", type="password", key="login_pwd")
 
-        if st.button("Se connecter"):
+        if st.button("Se connecter", key="btn_login"):
             conn = get_conn()
             cur = conn.cursor()
             cur.execute("SELECT * FROM app_users WHERE email = ?", (email,))
@@ -277,6 +278,7 @@ def auth_screen() -> bool:
             elif not verify_password(password, row["password_hash"]):
                 st.error("Email ou mot de passe incorrect.")
             else:
+                # On enregistre l'utilisateur dans la session
                 st.session_state["user"] = {
                     "id": row["id"],
                     "full_name": row["full_name"],
@@ -285,30 +287,43 @@ def auth_screen() -> bool:
                     "is_superadmin": bool(row["is_superadmin"]),
                 }
                 st.success("Connexion réussie.")
-                logged_in = True
+                # On relance l'app → au prochain run, on ne verra plus l'écran de login
+                st.experimental_rerun()
 
-    # --- Onglet création de compte ---
+    # ----- Onglet création de compte -----
     with tab_register:
         full_name = st.text_input("Nom complet", key="reg_name")
-        email = st.text_input("Email", key="reg_email")
+        email_reg = st.text_input("Email", key="reg_email")
         pwd1 = st.text_input("Mot de passe", type="password", key="reg_pwd1")
         pwd2 = st.text_input(
             "Confirmer le mot de passe", type="password", key="reg_pwd2"
         )
 
-        if st.button("Créer mon compte"):
-            if not full_name or not email or not pwd1:
+        if st.button("Créer mon compte", key="btn_register"):
+            if not full_name or not email_reg or not pwd1:
                 st.error("Tous les champs sont obligatoires.")
             elif pwd1 != pwd2:
                 st.error("Les mots de passe ne correspondent pas.")
             else:
                 try:
-                    register_root_user(full_name, email, pwd1)
-                    st.success("Compte créé avec succès. Vous pouvez maintenant vous connecter.")
+                    # Crée le compte principal (root) et récupère son id
+                    user_id = register_root_user(full_name, email_reg, pwd1)
+
+                    # Auto-login : on met directement l'utilisateur dans la session
+                    st.session_state["user"] = {
+                        "id": user_id,
+                        "full_name": full_name,
+                        "email": email_reg,
+                        "org_id": user_id,        # le root a org_id = son propre id
+                        "is_superadmin": False,
+                    }
+                    st.success("Compte créé, vous êtes maintenant connecté.")
+                    st.experimental_rerun()
                 except ValueError as e:
                     st.error(str(e))
 
-    return logged_in or ("user" in st.session_state)
+    # Tant qu'on n'a pas fait de rerun, on arrête l'app après l'écran d'auth
+    return logged_in
 
 
 # ----------------------------------------------------------
