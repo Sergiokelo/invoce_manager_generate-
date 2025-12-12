@@ -5,3 +5,8 @@
 !invoce_manager.py
 !bmanager_facturation.db
 !.gitignore
+# Streamlit / secrets
+.streamlit/
+
+# Bases de données locales
+*.db

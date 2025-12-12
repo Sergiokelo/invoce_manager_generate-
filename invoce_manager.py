@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime, date
 from io import BytesIO
 from decimal import Decimal, ROUND_HALF_UP
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -16,6 +17,9 @@ from num2words import num2words
 DB_PATH = "bmanager_facturation.db"
 
 
+# ----------------------------------------------------------
+# Connexion & initialisation de la base
+# ----------------------------------------------------------
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -26,11 +30,28 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+    # Utilisateurs / comptes
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            org_id INTEGER,
+            is_superadmin INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+        """
+    )
+
     # Clients
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER,
             name TEXT NOT NULL,
             email TEXT,
             phone TEXT
@@ -43,16 +64,18 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS cash_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER,
             name TEXT NOT NULL
         )
         """
     )
 
-    # Config société (avec signataire)
+    # Config entreprise
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS company_config (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER,
             name TEXT,
             legal_name TEXT,
             address TEXT,
@@ -72,6 +95,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER,
             client_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             due_date TEXT,
@@ -89,7 +113,7 @@ def init_db():
         """
     )
 
-    # Lignes de facture
+    # Lignes de factures
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS invoice_items (
@@ -107,6 +131,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER,
             invoice_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             amount REAL NOT NULL,
@@ -119,15 +144,23 @@ def init_db():
         """
     )
 
-    # Migrations douces
-    for alter in [
+    # Petites migrations pour compatibilité si tables déjà existantes
+    migrations = [
         "ALTER TABLE invoices ADD COLUMN doc_type TEXT DEFAULT 'FACTURE'",
         "ALTER TABLE invoices ADD COLUMN doc_number TEXT",
         "ALTER TABLE company_config ADD COLUMN signatory_name TEXT",
         "ALTER TABLE company_config ADD COLUMN signatory_title TEXT",
-    ]:
+        "ALTER TABLE company_config ADD COLUMN org_id INTEGER",
+        "ALTER TABLE clients ADD COLUMN org_id INTEGER",
+        "ALTER TABLE cash_accounts ADD COLUMN org_id INTEGER",
+        "ALTER TABLE invoices ADD COLUMN org_id INTEGER",
+        "ALTER TABLE payments ADD COLUMN org_id INTEGER",
+        "ALTER TABLE app_users ADD COLUMN created_at TEXT",
+        "ALTER TABLE app_users ADD COLUMN is_active INTEGER DEFAULT 1",
+    ]
+    for sql in migrations:
         try:
-            cur.execute(alter)
+            cur.execute(sql)
         except sqlite3.OperationalError:
             pass
 
@@ -135,18 +168,163 @@ def init_db():
     conn.close()
 
 
-# ---------- CONFIG SOCIETE ----------
+# ----------------------------------------------------------
+# Authentification & gestion utilisateurs
+# ----------------------------------------------------------
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-def get_company_config():
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return hash_password(password) == password_hash
+
+
+def ensure_superadmin():
+    """
+    Crée un superadmin s'il n'existe pas.
+    Essaie de lire ADMIN_EMAIL / ADMIN_PASSWORD dans st.secrets,
+    sinon utilise des valeurs par défaut.
+    """
+    try:
+        # Si secrets.toml existe et contient ces clés, on les utilise
+        admin_email = st.secrets["ADMIN_EMAIL"]
+        admin_password = st.secrets["ADMIN_PASSWORD"]
+    except Exception:
+        # Sinon, on prend ces valeurs par défaut en local
+        admin_email = "smasterkelo@gmail.com"
+        admin_password = "admin123"
+
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM company_config WHERE id = 1")
+    cur.execute("SELECT id FROM app_users WHERE is_superadmin=1")
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return
+
+    now = datetime.utcnow().isoformat()
+    pwd_hash = hash_password(admin_password)
+    cur.execute(
+        """
+        INSERT INTO app_users (full_name, email, password_hash, org_id,
+                               is_superadmin, is_active, created_at)
+        VALUES (?, ?, ?, NULL, 1, 1, ?)
+        """,
+        ("Super Admin", admin_email, pwd_hash, now),
+    )
+    admin_id = cur.lastrowid
+    cur.execute("UPDATE app_users SET org_id=? WHERE id=?", (admin_id, admin_id))
+    conn.commit()
+    conn.close()
+
+
+def register_root_user(full_name: str, email: str, password: str):
+    """
+    Crée le compte principal d'une organisation.
+    Le compte est directement actif, sans email de validation.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM app_users WHERE email = ?", (email,))
+    if cur.fetchone():
+        conn.close()
+        raise ValueError("Cet email est déjà utilisé.")
+
+    now = datetime.utcnow().isoformat()
+    pwd_hash = hash_password(password)
+    cur.execute(
+        """
+        INSERT INTO app_users (full_name, email, password_hash,
+                               is_superadmin, is_active, created_at)
+        VALUES (?, ?, ?, 0, 1, ?)
+        """,
+        (full_name, email, pwd_hash, now),
+    )
+    user_id = cur.lastrowid
+    # org_id = id du compte racine
+    cur.execute("UPDATE app_users SET org_id=? WHERE id=?", (user_id, user_id))
+    conn.commit()
+    conn.close()
+    return user_id
+
+
+def auth_screen() -> bool:
+    """
+    Écran de connexion / création de compte
+    """
+    st.title("💼 b-manager – Connexion")
+
+    tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
+    logged_in = False
+
+    # --- Onglet connexion ---
+    with tab_login:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Mot de passe", type="password", key="login_pwd")
+
+        if st.button("Se connecter"):
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM app_users WHERE email = ?", (email,))
+            row = cur.fetchone()
+            conn.close()
+
+            if not row:
+                st.error("Email ou mot de passe incorrect.")
+            elif not row["is_active"]:
+                st.warning("Votre compte est bloqué par l'administrateur.")
+            elif not verify_password(password, row["password_hash"]):
+                st.error("Email ou mot de passe incorrect.")
+            else:
+                st.session_state["user"] = {
+                    "id": row["id"],
+                    "full_name": row["full_name"],
+                    "email": row["email"],
+                    "org_id": row["org_id"],
+                    "is_superadmin": bool(row["is_superadmin"]),
+                }
+                st.success("Connexion réussie.")
+                logged_in = True
+
+    # --- Onglet création de compte ---
+    with tab_register:
+        full_name = st.text_input("Nom complet", key="reg_name")
+        email = st.text_input("Email", key="reg_email")
+        pwd1 = st.text_input("Mot de passe", type="password", key="reg_pwd1")
+        pwd2 = st.text_input(
+            "Confirmer le mot de passe", type="password", key="reg_pwd2"
+        )
+
+        if st.button("Créer mon compte"):
+            if not full_name or not email or not pwd1:
+                st.error("Tous les champs sont obligatoires.")
+            elif pwd1 != pwd2:
+                st.error("Les mots de passe ne correspondent pas.")
+            else:
+                try:
+                    register_root_user(full_name, email, pwd1)
+                    st.success("Compte créé avec succès. Vous pouvez maintenant vous connecter.")
+                except ValueError as e:
+                    st.error(str(e))
+
+    return logged_in or ("user" in st.session_state)
+
+
+# ----------------------------------------------------------
+# Fonctions de config & données
+# ----------------------------------------------------------
+def get_company_config(org_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM company_config WHERE org_id=? LIMIT 1", (org_id,))
     row = cur.fetchone()
     conn.close()
     return row
 
 
 def save_company_config(
+    org_id,
     name,
     legal_name,
     address,
@@ -160,10 +338,11 @@ def save_company_config(
 ):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM company_config WHERE id = 1")
-    exists = cur.fetchone() is not None
+    cur.execute("SELECT id FROM company_config WHERE org_id=?", (org_id,))
+    row = cur.fetchone()
 
-    if exists:
+    if row:
+        cfg_id = row["id"]
         if logo_bytes is not None:
             cur.execute(
                 """
@@ -171,7 +350,7 @@ def save_company_config(
                 SET name=?, legal_name=?, address=?, phone=?,
                     email=?, currency=?, footer=?, logo=?,
                     signatory_name=?, signatory_title=?
-                WHERE id=1
+                WHERE id=?
                 """,
                 (
                     name,
@@ -184,6 +363,7 @@ def save_company_config(
                     logo_bytes,
                     signatory_name,
                     signatory_title,
+                    cfg_id,
                 ),
             )
         else:
@@ -193,7 +373,7 @@ def save_company_config(
                 SET name=?, legal_name=?, address=?, phone=?,
                     email=?, currency=?, footer=?,
                     signatory_name=?, signatory_title=?
-                WHERE id=1
+                WHERE id=?
                 """,
                 (
                     name,
@@ -205,17 +385,19 @@ def save_company_config(
                     footer,
                     signatory_name,
                     signatory_title,
+                    cfg_id,
                 ),
             )
     else:
         cur.execute(
             """
             INSERT INTO company_config
-            (id, name, legal_name, address, phone, email,
+            (org_id, name, legal_name, address, phone, email,
              currency, footer, logo, signatory_name, signatory_title)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                org_id,
                 name,
                 legal_name,
                 address,
@@ -233,71 +415,90 @@ def save_company_config(
     conn.close()
 
 
-# ---------- CLIENTS / CAISSES ----------
-
-def create_client_if_not_exists(name):
+def create_client_if_not_exists(org_id, name):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM clients WHERE name = ?", (name,))
+    cur.execute(
+        "SELECT id FROM clients WHERE org_id=? AND name=?",
+        (org_id, name),
+    )
     row = cur.fetchone()
     if row:
         client_id = row["id"]
     else:
-        cur.execute("INSERT INTO clients (name) VALUES (?)", (name,))
+        cur.execute(
+            "INSERT INTO clients (org_id, name) VALUES (?, ?)", (org_id, name)
+        )
         client_id = cur.lastrowid
         conn.commit()
     conn.close()
     return client_id
 
 
-def get_clients():
+def get_clients(org_id):
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM clients ORDER BY name", conn)
+    df = pd.read_sql_query(
+        "SELECT * FROM clients WHERE org_id=? ORDER BY name",
+        conn,
+        params=(org_id,),
+    )
     conn.close()
     return df
 
 
-def get_cash_accounts():
+def get_cash_accounts(org_id):
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM cash_accounts ORDER BY name", conn)
+    df = pd.read_sql_query(
+        "SELECT * FROM cash_accounts WHERE org_id=? ORDER BY name",
+        conn,
+        params=(org_id,),
+    )
     conn.close()
     return df
 
 
-def create_cash_account_if_not_exists(name):
+def create_cash_account_if_not_exists(org_id, name):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM cash_accounts WHERE name = ?", (name,))
+    cur.execute(
+        "SELECT id FROM cash_accounts WHERE org_id=? AND name=?",
+        (org_id, name),
+    )
     row = cur.fetchone()
     if row:
         acc_id = row["id"]
     else:
-        cur.execute("INSERT INTO cash_accounts (name) VALUES (?)", (name,))
+        cur.execute(
+            "INSERT INTO cash_accounts (org_id, name) VALUES (?, ?)",
+            (org_id, name),
+        )
         acc_id = cur.lastrowid
         conn.commit()
     conn.close()
     return acc_id
 
 
-# ---------- FACTURES / PROFORMAS ----------
-
-def generate_invoice_number(doc_type: str, date_str: str) -> str:
+# ----------------------------------------------------------
+# Factures / proformas / paiements
+# ----------------------------------------------------------
+def generate_invoice_number(doc_type: str, date_str: str, org_id: int) -> str:
     conn = get_conn()
     cur = conn.cursor()
     ymd = date_str.replace("-", "")
     prefix = "PRO-FORMA" if doc_type == "PROFORMA" else "FACT"
     cur.execute(
-        "SELECT COUNT(*) AS c FROM invoices WHERE doc_type = ? AND date = ?",
-        (doc_type, date_str),
+        "SELECT COUNT(*) AS c FROM invoices WHERE org_id=? AND doc_type=? AND date=?",
+        (org_id, doc_type, date_str),
     )
     row = cur.fetchone()
-    count = row["c"] if row else 0
     conn.close()
+    count = row["c"] if row else 0
     seq = count + 1
     return f"{prefix}-{ymd}-{seq:03d}"
 
 
 def create_invoice(
+    org_id,
     client_id,
     date_str,
     due_date_str,
@@ -311,22 +512,24 @@ def create_invoice(
     subtotal = sum(m for _, m in items)
     tva_amount = round(subtotal * (tva_rate / 100.0), 2) if tva_rate > 0 else 0.0
     total_ttc = round(subtotal + tva_amount, 2)
-    doc_number = generate_invoice_number(doc_type, date_str)
+    doc_number = generate_invoice_number(doc_type, date_str, org_id)
 
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO invoices (
+            org_id,
             client_id, date, due_date,
             doc_type, doc_number,
             footer, currency,
             tva_rate, total_ht, tva_amount, total_ttc,
             note
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            org_id,
             client_id,
             date_str,
             due_date_str,
@@ -357,15 +560,15 @@ def create_invoice(
     return invoice_id
 
 
-def add_payment(invoice_id, date_str, amount, cash_account_id, receiver, note=""):
+def add_payment(org_id, invoice_id, date_str, amount, cash_account_id, receiver, note=""):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO payments (invoice_id, date, amount, cash_account_id, receiver, note)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO payments (org_id, invoice_id, date, amount, cash_account_id, receiver, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (invoice_id, date_str, amount, cash_account_id, receiver, note),
+        (org_id, invoice_id, date_str, amount, cash_account_id, receiver, note),
     )
     payment_id = cur.lastrowid
     conn.commit()
@@ -395,23 +598,20 @@ def compute_invoice_status(invoice_row):
     return total, paid, balance, status
 
 
-def get_invoices(filters=None):
+def get_invoices(org_id, filters=None):
     conn = get_conn()
-    base_query = "SELECT * FROM invoices"
-    params = []
-    where_clauses = []
+    base_query = "SELECT * FROM invoices WHERE org_id=?"
+    params = [org_id]
     if filters:
         if filters.get("client_id"):
-            where_clauses.append("client_id = ?")
+            base_query += " AND client_id=?"
             params.append(filters["client_id"])
         if filters.get("date_min"):
-            where_clauses.append("date >= ?")
+            base_query += " AND date>=?"
             params.append(filters["date_min"])
         if filters.get("date_max"):
-            where_clauses.append("date <= ?")
+            base_query += " AND date<=?"
             params.append(filters["date_max"])
-    if where_clauses:
-        base_query += " WHERE " + " AND ".join(where_clauses)
     base_query += " ORDER BY date DESC, id DESC"
     cur = conn.cursor()
     cur.execute(base_query, params)
@@ -426,7 +626,8 @@ def get_invoice_with_items(invoice_id):
     cur.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,))
     inv = cur.fetchone()
     cur.execute(
-        "SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id", (invoice_id,)
+        "SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id",
+        (invoice_id,),
     )
     items = cur.fetchall()
     conn.close()
@@ -506,13 +707,10 @@ def delete_payment(payment_id):
     conn.close()
 
 
-# ---------- MONTANT EN LETTRES (corrigé) ----------
-
+# ----------------------------------------------------------
+# Utilitaires DOCX (montant en lettres, styles, etc.)
+# ----------------------------------------------------------
 def amount_to_words_fr(amount: float) -> str:
-    """
-    101.16 -> 'cent un et seize centimes'
-    50.00  -> 'cinquante'
-    """
     value = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     entier = int(value)
     cents = int((value - Decimal(entier)) * 100)
@@ -524,8 +722,6 @@ def amount_to_words_fr(amount: float) -> str:
     return words_int
 
 
-# ---------- DOCX HELPERS ----------
-
 def _shade_cell(cell, fill_hex: str):
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
@@ -536,6 +732,9 @@ def _shade_cell(cell, fill_hex: str):
     tcPr.append(shd)
 
 
+# ----------------------------------------------------------
+# Construction de la facture (DOCX) – style amélioré
+# ----------------------------------------------------------
 def build_invoice_doc(invoice_id):
     conn = get_conn()
     cur = conn.cursor()
@@ -547,7 +746,7 @@ def build_invoice_doc(invoice_id):
     items = cur.fetchall()
     conn.close()
 
-    cfg = get_company_config()
+    cfg = get_company_config(inv["org_id"])
     total, paid, balance, status = compute_invoice_status(inv)
 
     try:
@@ -555,6 +754,7 @@ def build_invoice_doc(invoice_id):
     except Exception:
         date_display = inv["date"]
 
+    # Titre selon type
     if inv["doc_type"] == "PROFORMA":
         title_text = "FACTURE PRO FORMA"
         num_label = "N° proforma : "
@@ -570,11 +770,12 @@ def build_invoice_doc(invoice_id):
     section.left_margin = Inches(0.7)
     section.right_margin = Inches(0.7)
 
-    # En-tête logo + infos
+    # --- En-tête : logo + infos société + date / n°
     header_table = doc.add_table(rows=1, cols=2)
     header_table.alignment = WD_TABLE_ALIGNMENT.CENTER
     left, right = header_table.rows[0].cells
 
+    # Logo
     if cfg and cfg["logo"]:
         logo_stream = BytesIO(cfg["logo"])
         p_logo = left.paragraphs[0]
@@ -622,7 +823,7 @@ def build_invoice_doc(invoice_id):
     p6.add_run(f"{num_label}{num_value}")
     _shade_cell(right, "FFFFFF")
 
-    # Titre
+    # --- Titre central
     doc.add_paragraph("")
     title_para = doc.add_paragraph()
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -631,7 +832,7 @@ def build_invoice_doc(invoice_id):
     rt.font.size = Pt(16)
     rt.font.color.rgb = RGBColor(178, 34, 34)
 
-    # Bloc infos
+    # --- Bloc infos client + infos facture
     doc.add_paragraph("")
     info_table = doc.add_table(rows=1, cols=2)
     info_table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -649,7 +850,7 @@ def build_invoice_doc(invoice_id):
     p_inf.add_run(f"TVA : {inv['tva_rate']:.2f} %\n")
     p_inf.add_run(f"Total TTC : {total:,.2f} {inv['currency']}")
 
-    # Tableau lignes
+    # --- Tableau des lignes
     doc.add_paragraph("")
     items_table = doc.add_table(rows=1, cols=3)
     items_table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -675,7 +876,7 @@ def build_invoice_doc(invoice_id):
         for c in row_cells:
             _shade_cell(c, fill)
 
-    # Totaux
+    # --- Totaux
     doc.add_paragraph("")
     totals_table = doc.add_table(rows=5, cols=2)
     totals_table.alignment = WD_TABLE_ALIGNMENT.RIGHT
@@ -712,7 +913,7 @@ def build_invoice_doc(invoice_id):
         c_label.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
         c_val.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    # Montant en lettres (corrigé)
+    # Montant en lettres
     doc.add_paragraph("")
     try:
         total_words = amount_to_words_fr(total)
@@ -755,21 +956,24 @@ def build_invoice_doc(invoice_id):
     return buf.getvalue()
 
 
+# ----------------------------------------------------------
+# Construction du reçu (DOCX)
+# ----------------------------------------------------------
 def build_receipt_doc(payment_id):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM payments WHERE id=?", (payment_id,))
     pay = cur.fetchone()
-    cur.execute("SELECT * FROM invoices WHERE id=?", (pay['invoice_id'],))
+    cur.execute("SELECT * FROM invoices WHERE id=?", (pay["invoice_id"],))
     inv = cur.fetchone()
-    cur.execute("SELECT * FROM clients WHERE id=?", (inv['client_id'],))
+    cur.execute("SELECT * FROM clients WHERE id=?", (inv["client_id"],))
     client = cur.fetchone()
-    cur.execute("SELECT name FROM cash_accounts WHERE id=?", (pay['cash_account_id'],))
+    cur.execute("SELECT name FROM cash_accounts WHERE id=?", (pay["cash_account_id"],))
     cash_row = cur.fetchone()
     cash_name = cash_row["name"] if cash_row else "N/A"
     conn.close()
 
-    cfg = get_company_config()
+    cfg = get_company_config(inv["org_id"])
     total, paid_total, balance, status = compute_invoice_status(inv)
 
     doc = Document()
@@ -827,11 +1031,14 @@ def build_receipt_doc(payment_id):
     return buf.getvalue()
 
 
-# ---------- PAGES STREAMLIT ----------
-
+# ----------------------------------------------------------
+# Page CONFIGURATION
+# ----------------------------------------------------------
 def page_configuration():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
     st.header("⚙️ Configuration de l'entreprise")
-    cfg = get_company_config()
+    cfg = get_company_config(org_id)
 
     name_default = cfg["name"] if cfg and cfg["name"] else "b-manager"
     legal_default = (
@@ -889,6 +1096,7 @@ def page_configuration():
 
     if st.button("💾 Enregistrer la configuration"):
         save_company_config(
+            org_id,
             name,
             legal_name,
             address,
@@ -902,15 +1110,80 @@ def page_configuration():
         )
         st.success("Configuration enregistrée.")
 
+    # --- Gestion des utilisateurs du même compte (org)
+    st.markdown("---")
+    st.subheader("Utilisateurs de mon compte")
+
+    conn = get_conn()
+    df_users = pd.read_sql_query(
+        """
+        SELECT id, full_name, email, is_active
+        FROM app_users
+        WHERE org_id=?
+        ORDER BY created_at
+        """,
+        conn,
+        params=(org_id,),
+    )
+    conn.close()
+
+    st.dataframe(df_users)
+
+    max_users = 3
+    if len(df_users) >= max_users:
+        st.info("Vous avez atteint le nombre maximal d'utilisateurs pour ce compte (3).")
+    else:
+        st.markdown("### ➕ Ajouter un utilisateur supplémentaire")
+        sub_name = st.text_input("Nom complet du nouvel utilisateur", key="sub_name")
+        sub_email = st.text_input("Email du nouvel utilisateur", key="sub_email")
+        sub_pwd1 = st.text_input("Mot de passe", type="password", key="sub_pwd1")
+        sub_pwd2 = st.text_input(
+            "Confirmer le mot de passe", type="password", key="sub_pwd2"
+        )
+
+        if st.button("Ajouter cet utilisateur"):
+            if not sub_name or not sub_email or not sub_pwd1:
+                st.error("Tous les champs sont obligatoires.")
+            elif sub_pwd1 != sub_pwd2:
+                st.error("Les mots de passe ne correspondent pas.")
+            else:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM app_users WHERE email=?", (sub_email,))
+                if cur.fetchone():
+                    st.error("Cet email est déjà utilisé.")
+                else:
+                    now = datetime.utcnow().isoformat()
+                    pwd_hash = hash_password(sub_pwd1)
+                    cur.execute(
+                        """
+                        INSERT INTO app_users (
+                            full_name, email, password_hash,
+                            org_id, is_superadmin, is_active, created_at
+                        )
+                        VALUES (?, ?, ?, ?, 0, 1, ?)
+                        """,
+                        (sub_name, sub_email, pwd_hash, org_id, now),
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success(
+                        "Utilisateur ajouté. Il peut maintenant se connecter avec ses identifiants."
+                    )
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page CLIENTS
+# ----------------------------------------------------------
 def page_clients():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
     st.header("👥 Clients")
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
-    df = get_clients()
-
+    df = get_clients(org_id)
     options = ["[Nouveau client]"] + df["name"].tolist() if not df.empty else [
         "[Nouveau client]"
     ]
@@ -924,7 +1197,7 @@ def page_clients():
             if not name:
                 st.error("Le nom est obligatoire.")
             else:
-                cid = create_client_if_not_exists(name)
+                cid = create_client_if_not_exists(org_id, name)
                 conn = get_conn()
                 cur = conn.cursor()
                 cur.execute(
@@ -970,14 +1243,21 @@ def page_clients():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page CAISSES / COMPTES
+# ----------------------------------------------------------
 def page_caisses():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
     st.header("🏦 Caisses / comptes")
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
-    df = get_cash_accounts()
-    options = ["[Nouvelle caisse / compte]"] + df["name"].tolist() if not df.empty else [
-        "[Nouvelle caisse / compte]"
-    ]
+    df = get_cash_accounts(org_id)
+    options = (
+        ["[Nouvelle caisse / compte]"] + df["name"].tolist()
+        if not df.empty
+        else ["[Nouvelle caisse / compte]"]
+    )
     choice = st.selectbox("Sélectionner une caisse / un compte", options)
 
     if choice == "[Nouvelle caisse / compte]":
@@ -986,7 +1266,7 @@ def page_caisses():
             if not name:
                 st.error("Le nom est obligatoire.")
             else:
-                create_cash_account_if_not_exists(name)
+                create_cash_account_if_not_exists(org_id, name)
                 st.success("Caisse / compte enregistré.")
     else:
         row = df[df["name"] == choice].iloc[0]
@@ -1024,9 +1304,15 @@ def page_caisses():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page CRÉATION FACTURE / PROFORMA (+ aperçu stylé)
+# ----------------------------------------------------------
 def page_nouvelle_facture():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
+
     st.header("🧾 Créer une facture / proforma")
-    cfg = get_company_config()
+    cfg = get_company_config(org_id)
     company_name = cfg["name"] if cfg and cfg["name"] else "b-manager"
     company_legal = (
         cfg["legal_name"]
@@ -1042,8 +1328,7 @@ def page_nouvelle_facture():
     )
     internal_doc_type = "FACTURE" if doc_type_choice == "Facture" else "PROFORMA"
 
-    # Client
-    clients_df = get_clients()
+    clients_df = get_clients(org_id)
     client_names = ["[Nouveau client]"] + clients_df["name"].tolist()
     choix_client = st.selectbox("Client", client_names)
 
@@ -1055,7 +1340,7 @@ def page_nouvelle_facture():
             st.info("Saisissez le nom du client pour continuer.")
             st.markdown("</div>", unsafe_allow_html=True)
             return
-        client_id = create_client_if_not_exists(new_name)
+        client_id = create_client_if_not_exists(org_id, new_name)
         client_display_name = new_name
         conn = get_conn()
         cur = conn.cursor()
@@ -1082,7 +1367,6 @@ def page_nouvelle_facture():
             "TVA (%)", min_value=0.0, max_value=100.0, value=1.16, step=0.01
         )
 
-    # Lignes de facture
     st.subheader("Lignes de facture")
 
     if "nb_items" not in st.session_state:
@@ -1127,9 +1411,11 @@ def page_nouvelle_facture():
             f"_Montant en toutes lettres :_ {total_words} {currency}"
         )
 
-        # Prévisualisation facture
+        # --- Aperçu HTML stylé (comme on avait vu en image)
         date_str_for_number = date_facture.strftime("%Y-%m-%d")
-        number_preview = generate_invoice_number(internal_doc_type, date_str_for_number)
+        number_preview = generate_invoice_number(
+            internal_doc_type, date_str_for_number, org_id
+        )
         if internal_doc_type == "PROFORMA":
             preview_label = "N° proforma (prévisionnel)"
             title_text = "FACTURE PRO FORMA"
@@ -1219,14 +1505,13 @@ def page_nouvelle_facture():
         st.markdown("### 👀 Aperçu de la facture")
         st.markdown(preview_html, unsafe_allow_html=True)
 
-    # Pied de page & note
     default_footer = (
         cfg["footer"] if cfg and cfg["footer"] else "Merci pour votre confiance."
     )
     footer = st.text_area("Pied de page (conditions, remerciements…)", default_footer)
     note = st.text_area("Note interne (optionnel)", "")
 
-    # Paiement initial
+    # --- Paiement initial (optionnel)
     st.subheader("💳 Paiement initial (optionnel)")
     mode_paiement = st.selectbox(
         "Type de paiement initial",
@@ -1262,7 +1547,7 @@ def page_nouvelle_facture():
                 key="pay_init_amount",
             )
         with colB:
-            accounts_df = get_cash_accounts()
+            accounts_df = get_cash_accounts(org_id)
             acc_names = ["[Nouvelle caisse / compte]"] + accounts_df["name"].tolist()
             choix_acc = st.selectbox(
                 "Caisse / compte", acc_names, key="pay_init_acc"
@@ -1278,7 +1563,7 @@ def page_nouvelle_facture():
                 key="pay_init_newacc",
             )
             if new_acc:
-                cash_account_id = create_cash_account_if_not_exists(new_acc)
+                cash_account_id = create_cash_account_if_not_exists(org_id, new_acc)
         else:
             if accounts_df is not None and not accounts_df.empty:
                 row_acc = accounts_df[accounts_df["name"] == choix_acc].iloc[0]
@@ -1295,6 +1580,7 @@ def page_nouvelle_facture():
             key="pay_init_note",
         )
 
+    # --- Enregistrement de la facture
     if st.button("💾 Enregistrer le document"):
         if not items:
             st.error("Ajoutez au moins une ligne.")
@@ -1305,6 +1591,7 @@ def page_nouvelle_facture():
         due_str = due_date.strftime("%Y-%m-%d")
 
         invoice_id = create_invoice(
+            org_id=org_id,
             client_id=client_id,
             date_str=date_str,
             due_date_str=due_str,
@@ -1317,7 +1604,6 @@ def page_nouvelle_facture():
         )
         st.success(f"Document enregistré avec l'ID {invoice_id}.")
 
-        # Export DOCX
         doc_bytes = build_invoice_doc(invoice_id)
         st.download_button(
             "⬇️ Télécharger la facture / proforma (DOCX)",
@@ -1342,6 +1628,7 @@ def page_nouvelle_facture():
                     else f"Mode: {mode_text}"
                 )
             payment_id = add_payment(
+                org_id=org_id,
                 invoice_id=invoice_id,
                 date_str=pay_date.strftime("%Y-%m-%d"),
                 amount=amount_init,
@@ -1366,11 +1653,17 @@ def page_nouvelle_facture():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page PAIEMENTS & REÇUS
+# ----------------------------------------------------------
 def page_paiements():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
+
     st.header("💳 Paiements & reçus")
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
-    rows = get_invoices(None)
+    rows = get_invoices(org_id, None)
     if not rows:
         st.info("Aucune facture enregistrée pour l'instant.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1410,7 +1703,7 @@ def page_paiements():
             "Montant payé", min_value=0.0, value=default_amount, step=1.0
         )
     with col2:
-        accounts_df = get_cash_accounts()
+        accounts_df = get_cash_accounts(org_id)
         acc_names = ["[Nouvelle caisse / compte]"] + accounts_df["name"].tolist()
         choix_acc = st.selectbox("Caisse / compte", acc_names)
         receiver = st.text_input("Reçu par (nom de la personne)", "")
@@ -1420,7 +1713,7 @@ def page_paiements():
             "Nom de la nouvelle caisse / compte", "Caisse principale"
         )
         if new_acc:
-            cash_account_id = create_cash_account_if_not_exists(new_acc)
+            cash_account_id = create_cash_account_if_not_exists(org_id, new_acc)
         else:
             cash_account_id = None
     else:
@@ -1440,6 +1733,7 @@ def page_paiements():
                     f"Mode: {mode_text} - {note}" if note else f"Mode: {mode_text}"
                 )
             payment_id = add_payment(
+                org_id=org_id,
                 invoice_id=inv["id"],
                 date_str=pay_date.strftime("%Y-%m-%d"),
                 amount=amount,
@@ -1495,11 +1789,17 @@ def page_paiements():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page LISTE / FILTRES / EDITION DES FACTURES
+# ----------------------------------------------------------
 def page_factures():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
+
     st.header("📂 Documents & filtres")
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
-    clients_df = get_clients()
+    clients_df = get_clients(org_id)
     client_options = ["[Tous]"] + clients_df["name"].tolist()
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1518,7 +1818,7 @@ def page_factures():
         client_row = clients_df[clients_df["name"] == client_choice].iloc[0]
         filters["client_id"] = int(client_row["id"])
 
-    rows = get_invoices(filters)
+    rows = get_invoices(org_id, filters)
     if not rows:
         st.info("Aucun document ne correspond aux filtres.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1562,6 +1862,7 @@ def page_factures():
     group_client = df.groupby("Client ID")[["Total TTC", "Total payé", "Reste dû"]].sum()
     st.dataframe(group_client)
 
+    # --- Edition / suppression
     st.markdown("---")
     st.subheader("✏️ Modifier ou supprimer un document")
 
@@ -1646,14 +1947,32 @@ def page_factures():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------
+# Page RAPPORTS / CAISSE / GRAPHIQUES
+# ----------------------------------------------------------
 def page_rapports():
+    user = st.session_state["user"]
+    org_id = user["org_id"]
+
     st.header("📊 Rapports & caisse")
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
     conn = get_conn()
-    inv_df = pd.read_sql_query("SELECT * FROM invoices", conn)
-    pay_df = pd.read_sql_query("SELECT * FROM payments", conn)
-    acc_df = pd.read_sql_query("SELECT * FROM cash_accounts", conn)
+    inv_df = pd.read_sql_query(
+        "SELECT * FROM invoices WHERE org_id=?",
+        conn,
+        params=(org_id,),
+    )
+    pay_df = pd.read_sql_query(
+        "SELECT * FROM payments WHERE org_id=?",
+        conn,
+        params=(org_id,),
+    )
+    acc_df = pd.read_sql_query(
+        "SELECT * FROM cash_accounts WHERE org_id=?",
+        conn,
+        params=(org_id,),
+    )
     conn.close()
 
     if inv_df.empty:
@@ -1707,8 +2026,83 @@ def page_rapports():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ---------- MAIN ----------
+# ----------------------------------------------------------
+# Page SUPERADMIN : gestion globale des comptes
+# ----------------------------------------------------------
+def page_admin_accounts():
+    st.header("🔐 Administration – Gestion des comptes")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT id, full_name, email, is_active, org_id, created_at
+        FROM app_users
+        WHERE is_superadmin=0
+        ORDER BY created_at DESC
+        """,
+        conn,
+    )
+    conn.close()
+
+    if df.empty:
+        st.info("Aucun compte utilisateur pour l’instant.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    st.subheader("Liste des comptes")
+    for _, row in df.iterrows():
+        st.markdown("---")
+        st.write(
+            f"**{row['full_name']}** ({row['email']})  "
+            f"— org_id: `{row['org_id']}`  "
+            f"— créé le `{row['created_at']}`"
+        )
+        statut = "✅ Actif" if row["is_active"] == 1 else "⛔ Bloqué"
+        st.write(f"**Statut :** {statut}")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if row["is_active"] == 1:
+                if st.button(f"🚫 Bloquer #{row['id']}", key=f"block_{row['id']}"):
+                    conn = get_conn()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE app_users SET is_active=0 WHERE id=?",
+                        (int(row["id"]),),
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Compte {row['email']} bloqué.")
+                    st.experimental_rerun()
+            else:
+                if st.button(f"✅ Débloquer #{row['id']}", key=f"unblock_{row['id']}"):
+                    conn = get_conn()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE app_users SET is_active=1 WHERE id=?",
+                        (int(row["id"]),),
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Compte {row['email']} débloqué.")
+                    st.experimental_rerun()
+        with col3:
+            if st.button(f"🗑️ Supprimer #{row['id']}", key=f"del_{row['id']}"):
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute("DELETE FROM app_users WHERE id=?", (int(row["id"]),))
+                conn.commit()
+                conn.close()
+                st.warning(f"Compte {row['email']} supprimé.")
+                st.experimental_rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------
 def main():
     st.set_page_config(
         page_title="b-manager - Facturation",
@@ -1716,13 +2110,11 @@ def main():
         layout="wide",
     )
 
-    # Global style
+    # Style global + style de l’aperçu facture
     st.markdown(
         """
         <style>
-        .main {
-            background-color: #f5f7fb;
-        }
+        .main { background-color: #f5f7fb; }
         .stButton>button {
             border-radius: 999px;
             padding: 0.4rem 1.3rem;
@@ -1735,9 +2127,7 @@ def main():
             background: radial-gradient(circle at top left, #b91c1c 0, #111827 45%, #020617 100%);
             color: #f9fafb;
         }
-        [data-testid="stSidebar"] * {
-            color: #e5e7eb !important;
-        }
+        [data-testid="stSidebar"] * { color: #e5e7eb !important; }
         .sidebar-title {
             font-size: 0.9rem;
             font-weight: 600;
@@ -1745,15 +2135,6 @@ def main():
             text-transform: uppercase;
             color: #9ca3af;
             margin-bottom: 0.4rem;
-        }
-        div[role="radiogroup"] > label {
-            padding: 0.25rem 0.7rem;
-            border-radius: 999px;
-            margin-bottom: 0.2rem;
-        }
-        div[role="radiogroup"] > label[aria-checked="true"] {
-            background: rgba(248, 250, 252, 0.18);
-            box-shadow: 0 0 0 1px rgba(248, 250, 252, 0.35);
         }
         .section-card {
             background:#ffffff;
@@ -1763,146 +2144,75 @@ def main():
             margin-bottom:24px;
         }
         .preview-card {
-          max-width:850px;
-          margin:20px auto;
-          padding:22px 26px;
-          background:#ffffff;
-          border-radius:14px;
-          box-shadow:0 8px 22px rgba(15,23,42,0.08);
+          max-width:850px;margin:20px auto;padding:22px 26px;background:#ffffff;
+          border-radius:14px;box-shadow:0 8px 22px rgba(15,23,42,0.08);
           font-family:Segoe UI, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
           color:#111827;
         }
-        .preview-header {
-          display:flex;
-          justify-content:space-between;
-          align-items:flex-start;
-          margin-bottom:18px;
-        }
-        .preview-company {
-          font-size:15px;
-          font-weight:700;
-          color:#111827;
-          margin-bottom:2px;
-        }
-        .preview-tagline {
-          font-size:11px;
-          color:#6b7280;
-        }
-        .preview-address {
-          font-size:11px;
-          color:#6b7280;
-          margin-top:4px;
-        }
-        .preview-doc-meta {
-          text-align:right;
-        }
-        .preview-doc-title {
-          font-size:22px;
-          font-weight:800;
-          letter-spacing:1px;
-          color:#b91c1c;
-        }
-        .preview-doc-line {
-          font-size:11px;
-          color:#6b7280;
-        }
-        .preview-info-row {
-          display:flex;
-          justify-content:space-between;
-          background:#f3f6fb;
-          border-radius:10px;
-          padding:10px 14px;
-          margin-bottom:14px;
-        }
-        .preview-info-title {
-          font-size:11px;
-          font-weight:700;
-          color:#374151;
-          margin-bottom:4px;
-        }
-        .preview-info-value {
-          font-size:12px;
-          color:#111827;
-        }
-        .preview-info-value-small {
-          font-size:11px;
-          color:#4b5563;
-        }
-        .preview-table {
-          width:100%;
-          border-collapse:collapse;
-          margin-top:4px;
-          margin-bottom:10px;
-        }
-        .preview-table th {
-          background:#b91c1c;
-          color:#ffffff;
-          padding:6px 10px;
-          font-size:11px;
-          text-align:left;
-        }
-        .preview-table td {
-          padding:6px 10px;
-          font-size:12px;
-        }
-        .preview-table tbody tr:nth-child(even) {
-          background:#f3f6fb;
-        }
-        .preview-totals-row {
-          display:flex;
-          justify-content:flex-end;
-          margin-top:4px;
-        }
-        .preview-totals-table {
-          font-size:11px;
-          border-collapse:collapse;
-          min-width:260px;
-        }
-        .preview-totals-table td {
-          padding:4px 10px;
-          text-align:right;
-          background:#ffffff;
-        }
-        .preview-totals-table .preview-total-ttc td {
-          background:#b91c1c;
-          color:#ffffff;
-          font-weight:700;
-        }
-        .preview-words {
-          margin-top:12px;
-          padding:8px 12px;
-          border-radius:8px;
-          background:#f9fafb;
-          font-size:11px;
-          color:#374151;
-        }
-        .preview-words-label {
-          font-weight:600;
-        }
+        .preview-header {display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;}
+        .preview-company {font-size:15px;font-weight:700;color:#111827;margin-bottom:2px;}
+        .preview-tagline {font-size:11px;color:#6b7280;}
+        .preview-address {font-size:11px;color:#6b7280;margin-top:4px;}
+        .preview-doc-meta {text-align:right;}
+        .preview-doc-title {font-size:22px;font-weight:800;letter-spacing:1px;color:#b91c1c;}
+        .preview-doc-line {font-size:11px;color:#6b7280;}
+        .preview-info-row {display:flex;justify-content:space-between;background:#f3f6fb;border-radius:10px;padding:10px 14px;margin-bottom:14px;}
+        .preview-info-title {font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;}
+        .preview-info-value {font-size:12px;color:#111827;}
+        .preview-info-value-small {font-size:11px;color:#4b5563;}
+        .preview-table {width:100%;border-collapse:collapse;margin-top:4px;margin-bottom:10px;}
+        .preview-table th {background:#b91c1c;color:#ffffff;padding:6px 10px;font-size:11px;text-align:left;}
+        .preview-table td {padding:6px 10px;font-size:12px;}
+        .preview-table tbody tr:nth-child(even) {background:#f3f6fb;}
+        .preview-totals-row {display:flex;justify-content:flex-end;margin-top:4px;}
+        .preview-totals-table {font-size:11px;border-collapse:collapse;min-width:260px;}
+        .preview-totals-table td {padding:4px 10px;text-align:right;background:#ffffff;}
+        .preview-totals-table .preview-total-ttc td {background:#b91c1c;color:#ffffff;font-weight:700;}
+        .preview-words {margin-top:12px;padding:8px 12px;border-radius:8px;background:#f9fafb;font-size:11px;color:#374151;}
+        .preview-words-label {font-weight:600;}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     st.title("💼 b-manager – Mini application de facturation")
-    init_db()
 
+    init_db()
+    ensure_superadmin()
+
+    # Auth
+    if "user" not in st.session_state:
+        if not auth_screen():
+            st.stop()
+
+    user = st.session_state["user"]
+
+    # Sidebar
     st.sidebar.markdown(
         '<div class="sidebar-title">Navigation</div>', unsafe_allow_html=True
     )
-    menu = st.sidebar.radio(
-        "",
-        [
-            "👥 Clients",
-            "🏦 Caisses / comptes",
-            "💳 Paiements & reçus",
-            "🧾 Créer une facture / proforma",
-            "📂 Documents & filtres",
-            "📊 Rapports & caisse",
-            "⚙️ Configuration",
-        ],
-    )
 
+    nav_items = [
+        "👥 Clients",
+        "🏦 Caisses / comptes",
+        "💳 Paiements & reçus",
+        "🧾 Créer une facture / proforma",
+        "📂 Documents & filtres",
+        "📊 Rapports & caisse",
+        "⚙️ Configuration",
+    ]
+    if user["is_superadmin"]:
+        nav_items.append("🔐 Admin – Comptes utilisateurs")
+
+    menu = st.sidebar.radio("", nav_items)
+
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"Connecté en tant que **{user['full_name']}**")
+    if st.sidebar.button("Se déconnecter"):
+        st.session_state.clear()
+        st.experimental_rerun()
+
+    # Routing
     if "Clients" in menu:
         page_clients()
     elif "Caisses" in menu:
@@ -1917,7 +2227,8 @@ def main():
         page_rapports()
     elif "Configuration" in menu:
         page_configuration()
-# TODO: améliorer le design plus tard
+    elif "Admin" in menu:
+        page_admin_accounts()
 
 
 if __name__ == "__main__":
