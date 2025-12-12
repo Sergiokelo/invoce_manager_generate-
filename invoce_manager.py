@@ -2110,7 +2110,8 @@ def page_admin_accounts():
                 conn.commit()
                 conn.close()
                 st.warning(f"Compte {row['email']} supprimé.")
-                st.experimental_rerun()
+                st.rerun()
+
 
     st.markdown("</div>", unsafe_allow_html=True)
 
