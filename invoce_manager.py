@@ -1,8 +1,9 @@
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from io import BytesIO
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
+import secrets
 
 import pandas as pd
 import streamlit as st
@@ -42,6 +43,21 @@ def init_db():
             is_superadmin INTEGER DEFAULT 0,
             is_active INTEGER DEFAULT 1,
             created_at TEXT
+        )
+        """
+    )
+
+    # Sessions (pour login persistant)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at TEXT,
+            expires_at TEXT,
+            is_valid INTEGER DEFAULT 1,
+            FOREIGN KEY(user_id) REFERENCES app_users(id)
         )
         """
     )
@@ -182,17 +198,10 @@ def verify_password(password: str, password_hash: str) -> bool:
 def ensure_superadmin():
     """
     Crée un superadmin s'il n'existe pas.
-    Essaie de lire ADMIN_EMAIL / ADMIN_PASSWORD dans st.secrets,
-    sinon utilise des valeurs par défaut.
+    Version simple : pas de st.secrets, juste des valeurs par défaut.
     """
-    try:
-        # Si secrets.toml existe et contient ces clés, on les utilise
-        admin_email = st.secrets["ADMIN_EMAIL"]
-        admin_password = st.secrets["ADMIN_PASSWORD"]
-    except Exception:
-        # Sinon, on prend ces valeurs par défaut en local
-        admin_email = "smasterkelo@gmail.com"
-        admin_password = "admin123"
+    admin_email = "smasterkelo@gmail.com"
+    admin_password = "admin123"
 
     conn = get_conn()
     cur = conn.cursor()
@@ -249,15 +258,128 @@ def register_root_user(full_name: str, email: str, password: str):
     return user_id
 
 
+# ----------------------------------------------------------
+# Sessions persistantes (token)
+# ----------------------------------------------------------
+def create_session_token(user_id: int) -> str:
+    """
+    Crée un token de session pour un user, valide 30 jours.
+    """
+    token = secrets.token_hex(32)
+    now = datetime.utcnow()
+    expires = now + timedelta(days=30)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO app_sessions (user_id, token, created_at, expires_at, is_valid)
+        VALUES (?, ?, ?, ?, 1)
+        """,
+        (user_id, token, now.isoformat(), expires.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_user_by_session_token(token: str):
+    """
+    Retourne l'utilisateur lié à un token valide, ou None.
+    Gère l'expiration automatiquement.
+    """
+    if not token:
+        return None
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.*, s.expires_at
+        FROM app_sessions s
+        JOIN app_users u ON u.id = s.user_id
+        WHERE s.token=? AND s.is_valid=1
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    expires_at = row["expires_at"]
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at)
+            if datetime.utcnow() > exp_dt:
+                # Token expiré => on le désactive
+                cur.execute(
+                    "UPDATE app_sessions SET is_valid=0 WHERE token=?", (token,)
+                )
+                conn.commit()
+                conn.close()
+                return None
+        except Exception:
+            pass
+
+    conn.close()
+    return row
+
+
+def invalidate_session_token(token: str):
+    """
+    Désactive un token (déconnexion).
+    """
+    if not token:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE app_sessions SET is_valid=0 WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def get_current_session_token():
+    """
+    Récupère le token présent dans l'URL (?session=...).
+    """
+    try:
+        qp = st.query_params
+        val = qp.get("session", None)
+        # st.query_params peut retourner une liste
+        if isinstance(val, list):
+            return val[0] if val else None
+        return val
+    except Exception:
+        return None
+
+
+def set_current_session_token(token: str | None):
+    """
+    Met à jour le token dans l'URL :
+      - si token est None -> on supprime le paramètre
+      - sinon -> on le met à jour
+    """
+    try:
+        qp = st.query_params
+        if token is None:
+            if "session" in qp:
+                del qp["session"]
+        else:
+            qp["session"] = token
+    except Exception:
+        # Fallback silencieux
+        pass
+
+
 def auth_screen() -> bool:
     """
-    Affiche l'écran d'auth, retourne False pour stopper l'app
-    (on utilise st.experimental_rerun pour faire disparaître l'écran après login).
+    Affiche l'écran d'auth.
+    Utilise st.rerun() après login/inscription.
     """
     st.title("💼 b-manager – Connexion")
 
     tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
-    logged_in = False
 
     # ----- Onglet connexion -----
     with tab_login:
@@ -286,8 +408,11 @@ def auth_screen() -> bool:
                     "org_id": row["org_id"],
                     "is_superadmin": bool(row["is_superadmin"]),
                 }
+                # On crée un token de session et on le met dans l'URL
+                token = create_session_token(row["id"])
+                set_current_session_token(token)
+
                 st.success("Connexion réussie.")
-                # On relance l'app → au prochain run, on ne verra plus l'écran de login
                 st.rerun()
 
     # ----- Onglet création de compte -----
@@ -314,16 +439,21 @@ def auth_screen() -> bool:
                         "id": user_id,
                         "full_name": full_name,
                         "email": email_reg,
-                        "org_id": user_id,        # le root a org_id = son propre id
+                        "org_id": user_id,  # le root a org_id = son propre id
                         "is_superadmin": False,
                     }
+
+                    # Crée aussi le token de session
+                    token = create_session_token(user_id)
+                    set_current_session_token(token)
+
                     st.success("Compte créé, vous êtes maintenant connecté.")
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))
 
-    # Tant qu'on n'a pas fait de rerun, on arrête l'app après l'écran d'auth
-    return logged_in
+    # On ne l'utilise plus vraiment, mais on garde un bool pour compat
+    return False
 
 
 # ----------------------------------------------------------
@@ -1426,7 +1556,7 @@ def page_nouvelle_facture():
             f"_Montant en toutes lettres :_ {total_words} {currency}"
         )
 
-        # --- Aperçu HTML stylé (comme on avait vu en image)
+        # --- Aperçu HTML stylé
         date_str_for_number = date_facture.strftime("%Y-%m-%d")
         number_preview = generate_invoice_number(
             internal_doc_type, date_str_for_number, org_id
@@ -2089,7 +2219,7 @@ def page_admin_accounts():
                     conn.commit()
                     conn.close()
                     st.success(f"Compte {row['email']} bloqué.")
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 if st.button(f"✅ Débloquer #{row['id']}", key=f"unblock_{row['id']}"):
                     conn = get_conn()
@@ -2101,7 +2231,7 @@ def page_admin_accounts():
                     conn.commit()
                     conn.close()
                     st.success(f"Compte {row['email']} débloqué.")
-                    st.experimental_rerun()
+                    st.rerun()
         with col3:
             if st.button(f"🗑️ Supprimer #{row['id']}", key=f"del_{row['id']}"):
                 conn = get_conn()
@@ -2111,7 +2241,6 @@ def page_admin_accounts():
                 conn.close()
                 st.warning(f"Compte {row['email']} supprimé.")
                 st.rerun()
-
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2196,10 +2325,27 @@ def main():
     init_db()
     ensure_superadmin()
 
-    # Auth
+    # --- Tentative d'auto-login via token dans l'URL ---
     if "user" not in st.session_state:
-        if not auth_screen():
-            st.stop()
+        token = get_current_session_token()
+        if token:
+            row = get_user_by_session_token(token)
+            if row:
+                st.session_state["user"] = {
+                    "id": row["id"],
+                    "full_name": row["full_name"],
+                    "email": row["email"],
+                    "org_id": row["org_id"],
+                    "is_superadmin": bool(row["is_superadmin"]),
+                }
+            else:
+                # Token invalide ou expiré -> on le retire de l'URL
+                set_current_session_token(None)
+
+    # Si toujours pas d'utilisateur, on affiche l'écran d'auth
+    if "user" not in st.session_state:
+        auth_screen()
+        st.stop()
 
     user = st.session_state["user"]
 
@@ -2225,9 +2371,13 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.write(f"Connecté en tant que **{user['full_name']}**")
     if st.sidebar.button("Se déconnecter"):
+        # Invalider le token en base + nettoyer l'URL + session
+        token = get_current_session_token()
+        if token:
+            invalidate_session_token(token)
+        set_current_session_token(None)
         st.session_state.clear()
         st.rerun()
-
 
     # Routing
     if "Clients" in menu:
